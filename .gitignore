@@ -1,2 +1,6 @@
 .env
 .history
+.history
+poll_chat_map.json
+poll_storage.json
+current_poll_id.txt
