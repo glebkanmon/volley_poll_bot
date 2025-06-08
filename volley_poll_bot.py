@@ -23,7 +23,6 @@ uncertain_titles = [
     "Наверное",
     "Как карта ляжет",
     "Как сердце скажет",
-    "Как бог на душу положит",
     "Как судьба решит",
     "По воле случая",
     "Как ветер подует",
@@ -179,7 +178,7 @@ async def main():
     polling_task = asyncio.create_task(dp.start_polling(bot))
 
     # Ждём до 18:30
-    sleep_seconds = seconds_until(13, 42)
+    sleep_seconds = seconds_until(18, 30)
     logging.info(f"Sleeping for {sleep_seconds} seconds until 18:30")
     await asyncio.sleep(sleep_seconds)
 
