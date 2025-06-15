@@ -15,6 +15,7 @@ load_dotenv()
 
 API_TOKEN = os.getenv('BOT_TOKEN')
 GROUP_ID = int(os.getenv('GROUP_ID'))
+TOPIC_ID = int(os.getenv('TOPIC_ID'))  # <-- добавлено для поддержки тем
 STORAGE_FILE = "poll_storage.json"
 POLL_ID_FILE = "current_poll_id.txt"
 POLL_CHAT_MAP_FILE = "poll_chat_map.json"
@@ -122,7 +123,12 @@ async def send_results(bot: Bot, poll_id: str, poll_options: list):
     if not text:
         text = "Пока никто не проголосовал за игру!"
 
-    await bot.send_message(GROUP_ID, text, parse_mode=ParseMode.MARKDOWN_V2)
+    await bot.send_message(
+        GROUP_ID, 
+        text, 
+        parse_mode=ParseMode.MARKDOWN_V2, 
+        message_thread_id=TOPIC_ID  # <-- отправка итогов в тему
+    )
 
 async def main():
     logging.basicConfig(level=logging.INFO)
@@ -164,7 +170,8 @@ async def main():
         question=poll_title,
         options=poll_options,
         is_anonymous=False,
-        allows_multiple_answers=False
+        allows_multiple_answers=False,
+        message_thread_id=TOPIC_ID  # <-- опрос в нужную тему
     )
     await bot.pin_chat_message(
         chat_id=GROUP_ID,
