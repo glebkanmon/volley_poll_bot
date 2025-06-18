@@ -3,22 +3,25 @@ import logging
 import datetime
 import random
 import asyncio
-import json
+import re
 
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.types import PollAnswer
+import aiosqlite
+
+from aiogram import Bot, Dispatcher, types, Router, F
 from aiogram.enums.parse_mode import ParseMode
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove, CallbackQuery
+)
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
+# -------------- Конфиг и глобальные переменные ---------------
 load_dotenv()
-
 API_TOKEN = os.getenv('BOT_TOKEN')
-GROUP_ID = int(os.getenv('GROUP_ID'))
-TOPIC_ID = int(os.getenv('TOPIC_ID'))  # <-- добавлено для поддержки тем
-STORAGE_FILE = "poll_storage.json"
-POLL_ID_FILE = "current_poll_id.txt"
-POLL_CHAT_MAP_FILE = "poll_chat_map.json"
+DB_FILE = os.getenv("DB_FILE", "volley_poll_bot.sqlite3")
 
 uncertain_titles = [
     "Наверное",
@@ -32,175 +35,589 @@ uncertain_titles = [
     "Если ничего не пойдёт не так"
 ]
 
-def today_poll_title():
-    today = datetime.datetime.now().strftime("%d/%m")
-    return f"Играем {today}?"
+DAYS = [
+    ("Пн", "1"),
+    ("Вт", "2"),
+    ("Ср", "3"),
+    ("Чт", "4"),
+    ("Пт", "5"),
+    ("Сб", "6"),
+    ("Вс", "0"),
+]
+
+# -------------- Вспомогательные функции ----------------------
+
+def today_date_str():
+    return datetime.datetime.now().strftime("%d/%m")
 
 def build_poll_options():
     uncertain = random.choice(uncertain_titles)
     return ["Да 19:00", "Да 20:00", uncertain, "Нет"]
 
-def seconds_until(hour: int, minute: int) -> int:
-    now = datetime.datetime.now()
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target < now:
-        target += datetime.timedelta(days=1)
-    return int((target - now).total_seconds())
-
-def load_poll_votes():
-    if not os.path.exists(STORAGE_FILE):
-        return {}
-    with open(STORAGE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_poll_votes(data):
-    with open(STORAGE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def save_current_poll_id(poll_id):
-    with open(POLL_ID_FILE, "w") as f:
-        f.write(poll_id)
-
-def load_current_poll_id():
-    if not os.path.exists(POLL_ID_FILE):
-        return None
-    with open(POLL_ID_FILE, "r") as f:
-        return f.read().strip()
-
-def save_poll_chat_mapping(poll_id, chat_id):
-    mapping = {}
-    if os.path.exists(POLL_CHAT_MAP_FILE):
-        with open(POLL_CHAT_MAP_FILE, "r", encoding="utf-8") as f:
-            mapping = json.load(f)
-    mapping[poll_id] = chat_id
-    with open(POLL_CHAT_MAP_FILE, "w", encoding="utf-8") as f:
-        json.dump(mapping, f, ensure_ascii=False, indent=2)
-
-def load_poll_chat_mapping():
-    if not os.path.exists(POLL_CHAT_MAP_FILE):
-        return {}
-    with open(POLL_CHAT_MAP_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def markdown_v2_escape(text: str) -> str:
-    # Экранирует все спецсимволы MarkdownV2
-    to_escape = r'_*[]()~`>#+-=|{}.!'
-    return ''.join(f'\\{c}' if c in to_escape else c for c in text)
-
 def mention(user):
-    if user["username"]:
-        # username в Telegram не должен содержать спецсимволов, но экранируем на всякий случай
-        return f"@{markdown_v2_escape(user['username'])}"
+    if user.get("username"):
+        return f"@{user['username']}"
     else:
-        safe_name = markdown_v2_escape(user['first_name'])
+        safe_name = user['first_name']
         return f"[{safe_name}](tg://user?id={user['user_id']})"
 
-async def send_results(bot: Bot, poll_id: str, poll_options: list):
-    data = load_poll_votes()
-    votes = data.get(poll_id, [])
-    # Группируем по выбранным вариантам
-    by_option = {i: [] for i in range(len(poll_options))}
-    for user in votes:
-        if not user["option_ids"]:
-            continue
-        idx = user["option_ids"][0]
-        by_option[idx].append(user)
+def build_days_inline_keyboard(selected_days=None):
+    if selected_days is None:
+        selected_days = set()
+    keyboard = []
+    row = []
+    for day, val in DAYS:
+        text = f"✅ {day}" if day in selected_days else day
+        row.append(InlineKeyboardButton(text=text, callback_data=f"day_{val}"))
+        if len(row) == 4:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([
+        InlineKeyboardButton(text="Готово", callback_data="done"),
+        InlineKeyboardButton(text="Сбросить", callback_data="reset"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-    yes_19 = by_option.get(0, [])
-    yes_20 = by_option.get(1, [])
-    uncertain = by_option.get(2, [])
+def days_to_cron(selected_days):
+    days_map = {d: v for d, v in DAYS}
+    order = [d for d, v in DAYS]
+    if set(selected_days) == set(order):
+        return "*"
+    elif set(selected_days) == set(order[:5]):
+        return "1,2,3,4,5"
+    else:
+        return ",".join([days_map[d] for d in order if d in selected_days])
 
-    text = ""
-    if yes_19 or yes_20:
-        text += "Сегодня идут играть:\n"
-        if yes_19:
-            text += "19:00: " + ", ".join(mention(u) for u in yes_19) + "\n"
-        if yes_20:
-            text += "20:00: " + ", ".join(mention(u) for u in yes_20) + "\n"
-    if uncertain:
-        text += "\nЕщё есть время надумать:\n"
-        text += ", ".join(mention(u) for u in uncertain)
-    if not text:
-        text = "Пока никто не проголосовал за игру!"
+def time_to_cron(time_str):
+    match = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", time_str)
+    if not match:
+        return None
+    hour, minute = match.groups()
+    return int(minute), int(hour)
 
-    await bot.send_message(
-        GROUP_ID, 
-        text, 
-        parse_mode=ParseMode.MARKDOWN_V2, 
-        message_thread_id=TOPIC_ID  # <-- отправка итогов в тему
+# -------------- FSM для расписания ---------------------------
+
+class ScheduleStates(StatesGroup):
+    entering_poll_title = State()
+    add_date_to_title = State()
+    choosing_days = State()
+    entering_time = State()
+    confirm_update = State()
+    confirm_delete = State()
+
+# -------------- Работа с базой данных ------------------------
+
+async def init_db():
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.executescript("""
+CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY,
+    title TEXT,
+    is_active BOOLEAN DEFAULT 1,
+    processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS threads (
+    id INTEGER PRIMARY KEY,
+    group_id INTEGER NOT NULL,
+    title TEXT,
+    processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (group_id) REFERENCES groups(id)
+);
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS polls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_poll_id TEXT UNIQUE,
+    group_id INTEGER NOT NULL,
+    thread_id INTEGER,
+    question TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT TRUE,
+    processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (group_id) REFERENCES groups(id),
+    FOREIGN KEY (thread_id) REFERENCES threads(id)
+);
+CREATE TABLE IF NOT EXISTS poll_options (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    poll_id INTEGER NOT NULL,
+    option_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (poll_id) REFERENCES polls(id),
+    UNIQUE(poll_id, option_index)
+);
+CREATE TABLE IF NOT EXISTS votes (
+    poll_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    option_id INTEGER NOT NULL,
+    voted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (poll_id, user_id),
+    FOREIGN KEY (poll_id) REFERENCES polls(id),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (option_id) REFERENCES poll_options(id)
+);
+CREATE TABLE IF NOT EXISTS settings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT,
+    processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS poll_schedule (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id INTEGER NOT NULL,
+    thread_id INTEGER,
+    cron_expr TEXT NOT NULL,
+    poll_title TEXT,
+    add_date_to_title BOOLEAN DEFAULT 1,
+    is_active BOOLEAN DEFAULT 1,
+    processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (group_id) REFERENCES groups(id),
+    FOREIGN KEY (thread_id) REFERENCES threads(id)
+);
+            """)
+            await db.commit()
+        logging.info("DB initialized successfully")
+    except Exception as e:
+        logging.error(f"{datetime.datetime.now()}: Error initializing DB: {e}")
+
+async def add_group_and_thread(group_id, group_title, thread_id=None, thread_title=None):
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO groups (id, title) VALUES (?, ?)", (group_id, group_title)
+            )
+            if thread_id:
+                await db.execute(
+                    "INSERT OR IGNORE INTO threads (id, group_id, title) VALUES (?, ?, ?)",
+                    (thread_id, group_id, thread_title or "")
+                )
+            await db.commit()
+    except Exception as e:
+        logging.error(f"{datetime.datetime.now()}: Error adding group/thread: {e}")
+
+async def save_poll(telegram_poll_id, group_id, thread_id, question, options):
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT INTO polls (telegram_poll_id, group_id, thread_id, question) VALUES (?, ?, ?, ?)",
+                (telegram_poll_id, group_id, thread_id, question)
+            )
+            async with db.execute("SELECT id FROM polls WHERE telegram_poll_id=?", (telegram_poll_id,)) as cursor:
+                poll_row = await cursor.fetchone()
+                poll_id = poll_row[0]
+            for idx, opt in enumerate(options):
+                await db.execute(
+                    "INSERT INTO poll_options (poll_id, option_index, text) VALUES (?, ?, ?)",
+                    (poll_id, idx, opt)
+                )
+            await db.commit()
+            return poll_id
+    except Exception as e:
+        logging.error(f"{datetime.datetime.now()}: Error saving poll: {e}")
+        return None
+
+async def get_poll_id_by_telegram_poll_id(telegram_poll_id):
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute("SELECT id FROM polls WHERE telegram_poll_id=?", (telegram_poll_id,)) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else None
+    except Exception as e:
+        logging.error(f"{datetime.datetime.now()}: Error getting poll id by telegram id: {e}")
+        return None
+
+async def save_user(user: types.User):
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO users (id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
+                (user.id, user.username, user.first_name, user.last_name)
+            )
+            await db.commit()
+    except Exception as e:
+        logging.error(f"{datetime.datetime.now()}: Error saving user {user.id}: {e}")
+
+async def save_vote(poll_id, user: types.User, option_ids):
+    try:
+        await save_user(user)
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("DELETE FROM votes WHERE poll_id=? AND user_id=?", (poll_id, user.id))
+            option_id = option_ids[0] if option_ids else None
+            if option_id is not None:
+                async with db.execute("SELECT id FROM poll_options WHERE poll_id=? AND option_index=?",
+                                      (poll_id, option_id)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        await db.execute(
+                            "INSERT INTO votes (poll_id, user_id, option_id) VALUES (?, ?, ?)",
+                            (poll_id, user.id, row[0])
+                        )
+            await db.commit()
+    except Exception as e:
+        logging.error(f"{datetime.datetime.now()}: Error saving vote: {e}")
+
+async def get_existing_schedule(group_id, thread_id):
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT cron_expr, poll_title, add_date_to_title FROM poll_schedule WHERE group_id=? AND thread_id IS ? AND is_active=1",
+            (group_id, thread_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {"cron_expr": row[0], "poll_title": row[1], "add_date_to_title": row[2]}
+            return None
+
+async def save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "DELETE FROM poll_schedule WHERE group_id=? AND thread_id IS ?",
+            (group_id, thread_id)
+        )
+        await db.execute(
+            "INSERT INTO poll_schedule (group_id, thread_id, cron_expr, poll_title, add_date_to_title) VALUES (?, ?, ?, ?, ?)",
+            (group_id, thread_id, cron_expr, poll_title, int(add_date_to_title))
+        )
+        await db.commit()
+
+async def delete_schedule(group_id, thread_id):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "DELETE FROM poll_schedule WHERE group_id=? AND thread_id IS ?",
+            (group_id, thread_id)
+        )
+        await db.commit()
+
+# -------------- FSM-диалог для установки/изменения/удаления расписания ----------
+
+router = Router()
+
+@router.message(Command("poll_settings"))
+async def poll_settings_command(message: types.Message, state: FSMContext, bot: Bot):
+    group_id = message.chat.id
+    user_id = message.from_user.id
+
+    # Проверяем статус пользователя
+    try:
+        member = await bot.get_chat_member(chat_id=group_id, user_id=user_id)
+        status = member.status
+        if status not in ("administrator", "creator", "owner"):
+            await message.reply("Только администраторы могут настраивать расписание опросов.")
+            return
+    except Exception as e:
+        await message.reply("Не удалось проверить права пользователя.")
+        logging.error(f"Error checking admin rights: {e}")
+        return
+
+    group_title = message.chat.title or ""
+    thread_id = getattr(message, "message_thread_id", None)
+    thread_title = ""
+    await add_group_and_thread(group_id, group_title, thread_id, thread_title)
+    existing = await get_existing_schedule(group_id, thread_id)
+    if existing:
+        cron_str = existing["cron_expr"]
+        poll_title = existing["poll_title"]
+        add_date = bool(existing["add_date_to_title"])
+        msg = (
+            f"В этом чате уже настроено расписание опросов:\n"
+            f"Название: <b>{poll_title}</b>\n"
+            f"Добавлять дату: {'да' if add_date else 'нет'}\n"
+            f"Cron: <code>{cron_str}</code>\n\n"
+            "Что хотите сделать?"
+        )
+        await state.set_state(ScheduleStates.confirm_update)
+        await state.update_data(existing_cron=cron_str, existing_poll_title=poll_title, existing_add_date=add_date)
+        await message.answer(
+            msg,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="Изменить", callback_data="update_schedule"),
+                        InlineKeyboardButton(text="Оставить как есть", callback_data="keep_schedule"),
+                    ],
+                    [
+                        InlineKeyboardButton(text="Удалить расписание", callback_data="delete_schedule"),
+                    ]
+                ]
+            )
+        )
+    else:
+        await state.set_state(ScheduleStates.entering_poll_title)
+        await message.answer(
+            "Введите название опроса (например: Волейбол, Футбол, Бег, Шашлык и т.д.):"
+        )
+
+@router.message(ScheduleStates.entering_poll_title)
+async def entering_poll_title(message: types.Message, state: FSMContext):
+    poll_title = message.text.strip()
+    if not poll_title or len(poll_title) < 2:
+        await message.answer("Название опроса слишком короткое. Введите другое название.")
+        return
+    await state.update_data(poll_title=poll_title)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Да", callback_data="add_date_yes"),
+                InlineKeyboardButton(text="Нет", callback_data="add_date_no"),
+            ]
+        ]
+    )
+    await state.set_state(ScheduleStates.add_date_to_title)
+    await message.answer(
+        f"Добавлять дату публикации (ДД/ММ) к названию опроса?\n\n"
+        f"Вы ввели: <b>{poll_title}</b>\n\n"
+        f"Например: <b>{poll_title} {today_date_str()}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb
     )
 
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2))
-    dp = Dispatcher()
+@router.callback_query((F.data == "add_date_yes") | (F.data == "add_date_no"), ScheduleStates.add_date_to_title)
+async def add_date_to_title_choice(callback: CallbackQuery, state: FSMContext):
+    add_date = callback.data == "add_date_yes"
+    await state.update_data(add_date_to_title=add_date)
+    await state.set_state(ScheduleStates.choosing_days)
+    kb = build_days_inline_keyboard()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        "Выберите дни для расписания опроса:",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "delete_schedule", ScheduleStates.confirm_update)
+async def delete_schedule_confirm(callback: CallbackQuery, state: FSMContext):
+    group_id = callback.message.chat.id
+    thread_id = getattr(callback.message, "message_thread_id", None)
+    await delete_schedule(group_id, thread_id)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Расписание опросов для этого чата/темы удалено.")
+    await state.clear()
+    await callback.answer()
+
+@router.callback_query(F.data == "update_schedule", ScheduleStates.confirm_update)
+async def confirm_update_schedule(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ScheduleStates.entering_poll_title)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        "Введите новое название опроса (например: Волейбол, Футбол, Бег, Шашлык и т.д.):"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "keep_schedule", ScheduleStates.confirm_update)
+async def keep_schedule(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Расписание оставлено без изменений.")
+    await state.clear()
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("day_"), ScheduleStates.choosing_days)
+async def on_day_toggle(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected_days = set(data.get("selected_days", []))
+    day_val = callback.data.split("_")[1]
+    day = next(d for d, v in DAYS if v == day_val)
+    if day in selected_days:
+        selected_days.remove(day)
+    else:
+        selected_days.add(day)
+    await state.update_data(selected_days=list(selected_days))
+    kb = build_days_inline_keyboard(selected_days)
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data == "reset", ScheduleStates.choosing_days)
+async def on_reset(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(selected_days=[])
+    kb = build_days_inline_keyboard()
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer("Выбор сброшен.")
+
+@router.callback_query(F.data == "done", ScheduleStates.choosing_days)
+async def on_done(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected_days = set(data.get("selected_days", []))
+    if not selected_days:
+        await callback.answer("Выберите хотя бы один день!", show_alert=True)
+        return
+    await state.set_state(ScheduleStates.entering_time)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        "Введите время опроса в формате ЧЧ:ММ (например, 18:30):"
+    )
+    await state.update_data(selected_days=list(selected_days))
+    await callback.answer()
+
+@router.message(ScheduleStates.entering_time)
+async def enter_time(message: types.Message, state: FSMContext):
+    time_str = message.text.strip()
+    time_res = time_to_cron(time_str)
+    if not time_res:
+        await message.answer("Некорректный формат времени! Введите, например, 18:30")
+        return
+    minute, hour = time_res
+    data = await state.get_data()
+    selected_days = set(data.get("selected_days", []))
+    cron_days = days_to_cron(selected_days)
+    cron_expr = f"{minute} {hour} * * {cron_days}"
+    poll_title = data.get("poll_title", "Опрос")
+    add_date_to_title = data.get("add_date_to_title", True)
+    group_id = message.chat.id
+    thread_id = getattr(message, "message_thread_id", None)
+    try:
+        await save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title)
+        await message.answer(
+            f"Новое расписание сохранено!\n"
+            f"Название опроса: <b>{poll_title}</b>\n"
+            f"Добавлять дату: {'да' if add_date_to_title else 'нет'}\n"
+            f"Cron: <code>{cron_expr}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove()
+        )
+    except Exception as e:
+        await message.answer("Ошибка при сохранении расписания.")
+        logging.error(f"{datetime.datetime.now()}: Error saving schedule: {e}")
+    await state.clear()
+
+# -------------- Автоматический запуск опросов по расписанию --
+
+async def get_due_schedules(now=None):
+    if now is None:
+        now = datetime.datetime.now()
+    minute = now.minute
+    hour = now.hour
+    weekday = now.weekday()
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT group_id, thread_id, cron_expr, poll_title, add_date_to_title FROM poll_schedule WHERE is_active=1"
+            ) as cursor:
+                rows = await cursor.fetchall()
+        result = []
+        for group_id, thread_id, cron_expr, poll_title, add_date_to_title in rows:
+            m = re.match(r'^(\*|\d{1,2})\s+(\*|\d{1,2})\s+\*\s+\*\s+([\d*,]*)$', cron_expr)
+            if not m:
+                continue
+            cm, ch, cd = m.group(1), m.group(2), m.group(3)
+            if cm != "*" and int(cm) != minute:
+                continue
+            if ch != "*" and int(ch) != hour:
+                continue
+            if cd == "*" or cd == "":
+                result.append((group_id, thread_id, poll_title, bool(add_date_to_title)))
+            else:
+                cd_set = {int(i) for i in cd.split(",")}
+                if weekday in cd_set:
+                    result.append((group_id, thread_id, poll_title, bool(add_date_to_title)))
+        return result
+    except Exception as e:
+        logging.error(f"{datetime.datetime.now()}: Error fetching due schedules: {e}")
+        return []
+
+async def start_new_poll(bot, group_id, thread_id, poll_title, add_date_to_title):
+    try:
+        chat = await bot.get_chat(group_id)
+        group_title = chat.title or ""
+        thread_title = ""
+        await add_group_and_thread(group_id, group_title, thread_id, thread_title)
+    except Exception as e:
+        logging.error(f"{datetime.datetime.now()}: Error fetching chat info: {e}")
+        await add_group_and_thread(group_id, "", thread_id, "")
 
     poll_options = build_poll_options()
-    poll_title = today_poll_title()
+    poll_title_final = f"{poll_title} {today_date_str()}" if add_date_to_title else poll_title
 
-    # Удаляем вебхук, если он активен, чтобы не было конфликта с polling
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    # Событие — обработка голосов
-    @dp.poll_answer()
-    async def poll_answer_handler(poll_answer: types.PollAnswer):
-        poll_chat_map = load_poll_chat_mapping()
-        poll_id = poll_answer.poll_id
-        chat_id = poll_chat_map.get(poll_id)
-        # Проверяем, что ответ именно из нужного чата
-        if chat_id is None or int(chat_id) != GROUP_ID:
-            return
-
-        data = load_poll_votes()
-        if poll_id not in data:
-            data[poll_id] = []
-        # Сохраняем уникально (не дублируем user_id)
-        data[poll_id] = [u for u in data[poll_id] if u["user_id"] != poll_answer.user.id]
-        data[poll_id].append({
-            "user_id": poll_answer.user.id,
-            "username": poll_answer.user.username,
-            "first_name": poll_answer.user.first_name,
-            "option_ids": poll_answer.option_ids
-        })
-        save_poll_votes(data)
-
-    # Создаём опрос
-    poll_message = await bot.send_poll(
-        chat_id=GROUP_ID,
-        question=poll_title,
-        options=poll_options,
-        is_anonymous=False,
-        allows_multiple_answers=False,
-        message_thread_id=TOPIC_ID  # <-- опрос в нужную тему
-    )
-    await bot.pin_chat_message(
-        chat_id=GROUP_ID,
-        message_id=poll_message.message_id,
-        disable_notification=False
-    )
-
-    poll_id = poll_message.poll.id
-    save_current_poll_id(poll_id)
-    save_poll_chat_mapping(poll_id, poll_message.chat.id)
-
-    # Запускаем polling параллельно со sleep
-    polling_task = asyncio.create_task(dp.start_polling(bot))
-
-    # Ждём до 18:30
-    sleep_seconds = seconds_until(18, 30)
-    logging.info(f"Sleeping for {sleep_seconds} seconds until 18:30")
-    await asyncio.sleep(sleep_seconds)
-
-    # После сна формируем и отправляем сообщение с результатами
-    await send_results(bot, poll_id, poll_options)
-
-    # Останавливаем polling и закрываем сессию
-    polling_task.cancel()
     try:
-        await polling_task
-    except asyncio.CancelledError:
-        pass
-    await bot.session.close()
+        poll_message = await bot.send_poll(
+            chat_id=group_id,
+            question=poll_title_final,
+            options=poll_options,
+            is_anonymous=False,
+            allows_multiple_answers=False,
+            message_thread_id=thread_id
+        )
+        await bot.pin_chat_message(
+            chat_id=group_id,
+            message_id=poll_message.message_id,
+            disable_notification=False
+        )
+        telegram_poll_id = poll_message.poll.id
+        await save_poll(telegram_poll_id, group_id, thread_id, poll_title_final, poll_options)
+    except Exception as e:
+        logging.error(f"{datetime.datetime.now()}: Error creating or pinning poll: {e}")
+
+async def poll_scheduler(bot):
+    while True:
+        try:
+            now = datetime.datetime.now()
+            due = await get_due_schedules(now)
+            for group_id, thread_id, poll_title, add_date_to_title in due:
+                await start_new_poll(bot, group_id, thread_id, poll_title, add_date_to_title)
+        except Exception as e:
+            logging.error(f"{datetime.datetime.now()}: Error in scheduler: {e}")
+        await asyncio.sleep(60)
+
+# -------------- Обработка голосов ----------------------------
+
+async def get_poll_options_by_poll_id(poll_id):
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute(
+                "SELECT option_index, text FROM poll_options WHERE poll_id=? ORDER BY option_index",
+                (poll_id,)
+            ) as cursor:
+                opts = await cursor.fetchall()
+        return [opt[1] for opt in sorted(opts, key=lambda x: x[0])]
+    except Exception as e:
+        logging.error(f"{datetime.datetime.now()}: Error getting poll options: {e}")
+        return []
+
+# -------------- Main ----------------------------------------
+
+async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    await init_db()
+    try:
+        bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=None))
+        dp = Dispatcher()
+        dp.include_router(router)
+
+        @dp.poll_answer()
+        async def poll_answer_handler(poll_answer: types.PollAnswer):
+            try:
+                telegram_poll_id = poll_answer.poll_id
+                poll_id = await get_poll_id_by_telegram_poll_id(telegram_poll_id)
+                if not poll_id:
+                    logging.warning(f"{datetime.datetime.now()}: poll_id not found for telegram_poll_id={telegram_poll_id}")
+                    return
+                await save_vote(poll_id, poll_answer.user, poll_answer.option_ids)
+            except Exception as e:
+                logging.error(f"{datetime.datetime.now()}: Error in poll_answer_handler: {e}")
+
+        asyncio.create_task(poll_scheduler(bot))
+
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            logging.error(f"{datetime.datetime.now()}: Error deleting webhook: {e}")
+
+        logging.info("Bot started polling.")
+        await dp.start_polling(bot)
+    except Exception as e:
+        logging.error(f"{datetime.datetime.now()}: Unhandled error in main: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
