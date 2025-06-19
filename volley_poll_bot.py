@@ -4,7 +4,6 @@ import datetime
 import random
 import asyncio
 import re
-import json
 
 import aiosqlite
 
@@ -35,6 +34,7 @@ uncertain_titles = [
     "Как туман рассеется — узнаем",
     "Если ничего не пойдёт не так"
 ]
+NEGATIVE_TITLE = "Нет"
 
 DAYS = [
     ("Пн", "1"),
@@ -108,35 +108,58 @@ def get_answer_sort_key(text):
 async def get_default_answer_templates():
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
-            "SELECT id, text FROM answer_templates ORDER BY sort_time ASC NULLS LAST, id ASC"
+            "SELECT id, text FROM answer_templates WHERE uncertain_flg=0 AND negative_flg=0 ORDER BY sort_time ASC NULLS LAST, id ASC"
         ) as cursor:
             return [(row[0], row[1]) for row in await cursor.fetchall()]
 
+async def get_random_uncertain_answer():
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT id, text FROM answer_templates WHERE uncertain_flg=1"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            if rows:
+                return random.choice(rows)
+    return None
+
+async def get_negative_answer():
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT id, text FROM answer_templates WHERE negative_flg=1"
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return row
+    return None
+
 async def init_answer_templates():
     answers = [
-        ("Да 19:00", 19*60),
-        ("Да 20:00", 20*60)
+        ("Да 19:00", 19*60, 0, 0),
+        ("Да 20:00", 20*60, 0, 0)
     ]
+    uncertain_answers = [(text, None, 1, 0) for text in uncertain_titles]
+    negative_answer = [(NEGATIVE_TITLE, None, 0, 1)]
+    all_answers = answers + uncertain_answers + negative_answer
     async with aiosqlite.connect(DB_FILE) as db:
-        for text, sort_time in answers:
+        for text, sort_time, uncertain_flg, negative_flg in all_answers:
             await db.execute(
-                "INSERT OR IGNORE INTO answer_templates (text, sort_time) VALUES (?, ?)",
-                (text, sort_time)
+                "INSERT OR IGNORE INTO answer_templates (text, sort_time, uncertain_flg, negative_flg) VALUES (?, ?, ?, ?)",
+                (text, sort_time, uncertain_flg, negative_flg)
             )
         await db.commit()
 
 async def get_or_create_answer_template(text):
     sort_time = parse_time_from_text(text)
     async with aiosqlite.connect(DB_FILE) as db:
+        # Не даём пользователю добавить "Нет" и неопределённые варианты
         async with db.execute(
             "SELECT id FROM answer_templates WHERE LOWER(text)=LOWER(?)", (text,)
         ) as cursor:
             row = await cursor.fetchone()
             if row:
                 return row[0]
-        # create new one
         cur = await db.execute(
-            "INSERT INTO answer_templates (text, sort_time) VALUES (?, ?)", (text, sort_time)
+            "INSERT INTO answer_templates (text, sort_time, uncertain_flg, negative_flg) VALUES (?, ?, 0, 0)", (text, sort_time)
         )
         await db.commit()
         return cur.lastrowid
@@ -241,13 +264,19 @@ CREATE TABLE IF NOT EXISTS poll_schedule (
     add_date_to_title BOOLEAN DEFAULT 1,
     is_active BOOLEAN DEFAULT 1,
     processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP,
+    uncertain_option INTEGER,
+    negative_option INTEGER,
     FOREIGN KEY (group_id) REFERENCES groups(id),
-    FOREIGN KEY (thread_id) REFERENCES threads(id)
+    FOREIGN KEY (thread_id) REFERENCES threads(id),
+    FOREIGN KEY (uncertain_option) REFERENCES answer_templates(id),
+    FOREIGN KEY (negative_option) REFERENCES answer_templates(id)
 );
 CREATE TABLE IF NOT EXISTS answer_templates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     text TEXT NOT NULL UNIQUE,
     sort_time INTEGER,
+    uncertain_flg INTEGER DEFAULT 0,
+    negative_flg INTEGER DEFAULT 0,
     processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS poll_schedule_x_answer_template (
@@ -346,7 +375,7 @@ async def save_vote(poll_id, user: types.User, option_ids):
 async def get_existing_schedule(group_id, thread_id):
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
-            "SELECT id, cron_expr, poll_title, add_date_to_title FROM poll_schedule WHERE group_id=? AND thread_id IS ? AND is_active=1",
+            "SELECT id, cron_expr, poll_title, add_date_to_title, uncertain_option, negative_option FROM poll_schedule WHERE group_id=? AND thread_id IS ? AND is_active=1",
             (group_id, thread_id)
         ) as cursor:
             row = await cursor.fetchone()
@@ -355,11 +384,13 @@ async def get_existing_schedule(group_id, thread_id):
                     "id": row[0],
                     "cron_expr": row[1],
                     "poll_title": row[2],
-                    "add_date_to_title": row[3]
+                    "add_date_to_title": row[3],
+                    "uncertain_option": row[4],
+                    "negative_option": row[5]
                 }
             return None
 
-async def save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title, answer_template_ids):
+async def save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title, answer_template_ids, uncertain_option_id, negative_option_id):
     async with aiosqlite.connect(DB_FILE) as db:
         # Delete old schedule and options
         async with db.execute(
@@ -371,8 +402,8 @@ async def save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, ad
                 await db.execute("DELETE FROM poll_schedule WHERE id=?", (old[0],))
         # Insert new schedule
         cur = await db.execute(
-            "INSERT INTO poll_schedule (group_id, thread_id, cron_expr, poll_title, add_date_to_title) VALUES (?, ?, ?, ?, ?)",
-            (group_id, thread_id, cron_expr, poll_title, int(add_date_to_title))
+            "INSERT INTO poll_schedule (group_id, thread_id, cron_expr, poll_title, add_date_to_title, uncertain_option, negative_option) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (group_id, thread_id, cron_expr, poll_title, int(add_date_to_title), uncertain_option_id, negative_option_id)
         )
         poll_schedule_id = cur.lastrowid
         # Insert options
@@ -401,6 +432,15 @@ async def get_schedule_option_ids(poll_schedule_id):
             (poll_schedule_id,)
         ) as cursor:
             return [row[0] for row in await cursor.fetchall()]
+
+async def get_schedule_special_option(poll_schedule_id, flag_type="uncertain"):
+    col = "uncertain_option" if flag_type == "uncertain" else "negative_option"
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            f"SELECT {col} FROM poll_schedule WHERE id=?", (poll_schedule_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row and row[0] else None
 
 # -------------- FSM-диалог для настройки опций опроса --------
 
@@ -490,7 +530,7 @@ async def add_date_to_title_choice(callback: CallbackQuery, state: FSMContext):
     add_date = callback.data == "add_date_yes"
     await state.update_data(add_date_to_title=add_date)
     default_options = await get_default_answer_templates()
-    await state.update_data(available_options=default_options, selected_options=[])
+    await state.update_data(available_options=default_options, selected_options=[], uncertain_option_id=None, negative_option_id=None)
     await state.set_state(ScheduleStates.choosing_poll_options)
     await send_options_choice(callback.message, state)
     await callback.answer()
@@ -520,7 +560,6 @@ async def on_option_chosen(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     selected_options = data.get("selected_options", [])
     available_options = data.get("available_options", [])
-    # Найти текст по id
     text = next((t for i, t in available_options if i == opt_id), None)
     if text and (opt_id, text) not in selected_options:
         selected_options.append((opt_id, text))
@@ -542,6 +581,14 @@ async def process_custom_option(message: types.Message, state: FSMContext):
     if not option or len(option) < 2:
         await message.answer("Вариант слишком короткий. Введите другой вариант.")
         return
+    # Не даём добавить "Нет" и неопределённые варианты
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT 1 FROM answer_templates WHERE (uncertain_flg=1 OR negative_flg=1) AND LOWER(text)=LOWER(?)", (option,)
+        ) as cursor:
+            if await cursor.fetchone():
+                await message.answer("Такой вариант добавлять нельзя. Введите другой вариант.")
+                return
     data = await state.get_data()
     selected_options = data.get("selected_options", [])
     available_options = data.get("available_options", [])
@@ -591,16 +638,9 @@ async def options_done(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "add_uncertain", ScheduleStates.ask_uncertain_option)
 async def add_uncertain_option(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    uncertain = random.choice(uncertain_titles)
-    opt_id = await get_or_create_answer_template(uncertain)
-    selected_options = data.get("selected_options", [])
-    available_options = data.get("available_options", [])
-    if (opt_id, uncertain) not in selected_options:
-        selected_options.append((opt_id, uncertain))
-    if (opt_id, uncertain) not in available_options:
-        available_options.append((opt_id, uncertain))
-    await state.update_data(selected_options=selected_options, available_options=available_options)
+    uncertain = await get_random_uncertain_answer()
+    uncertain_id = uncertain[0] if uncertain else None
+    await state.update_data(uncertain_option_id=uncertain_id)
     await state.set_state(ScheduleStates.ask_negative_option)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -614,6 +654,7 @@ async def add_uncertain_option(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "skip_uncertain", ScheduleStates.ask_uncertain_option)
 async def skip_uncertain_option(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(uncertain_option_id=None)
     await state.set_state(ScheduleStates.ask_negative_option)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -627,15 +668,9 @@ async def skip_uncertain_option(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "add_negative", ScheduleStates.ask_negative_option)
 async def add_negative_option(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    opt_id = await get_or_create_answer_template("Нет")
-    selected_options = data.get("selected_options", [])
-    available_options = data.get("available_options", [])
-    if (opt_id, "Нет") not in selected_options:
-        selected_options.append((opt_id, "Нет"))
-    if (opt_id, "Нет") not in available_options:
-        available_options.append((opt_id, "Нет"))
-    await state.update_data(selected_options=selected_options, available_options=available_options)
+    negative = await get_negative_answer()
+    negative_id = negative[0] if negative else None
+    await state.update_data(negative_option_id=negative_id)
     await state.set_state(ScheduleStates.choosing_days)
     kb = build_days_inline_keyboard()
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -644,13 +679,12 @@ async def add_negative_option(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "skip_negative", ScheduleStates.ask_negative_option)
 async def skip_negative_option(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(negative_option_id=None)
     await state.set_state(ScheduleStates.choosing_days)
     kb = build_days_inline_keyboard()
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer("Выберите дни для расписания опроса:", reply_markup=kb)
     await callback.answer()
-
-# ------------------- Остальные старые FSM -------------------
 
 @router.callback_query(F.data == "delete_schedule", ScheduleStates.confirm_update)
 async def delete_schedule_confirm(callback: CallbackQuery, state: FSMContext):
@@ -731,10 +765,12 @@ async def enter_time(message: types.Message, state: FSMContext):
     add_date_to_title = data.get("add_date_to_title", True)
     selected_options = data.get("selected_options", [])
     answer_template_ids = [opt_id for opt_id, _ in selected_options]
+    uncertain_option_id = data.get("uncertain_option_id", None)
+    negative_option_id = data.get("negative_option_id", None)
     group_id = message.chat.id
     thread_id = getattr(message, "message_thread_id", None)
     try:
-        await save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title, answer_template_ids)
+        await save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title, answer_template_ids, uncertain_option_id, negative_option_id)
         await message.answer(
             f"Новое расписание сохранено!\n"
             f"Название опроса: <b>{poll_title}</b>\n"
@@ -796,8 +832,17 @@ async def start_new_poll(bot, sched_id, group_id, thread_id, poll_title, add_dat
     poll_title_final = f"{poll_title} {today_date_str()}" if add_date_to_title else poll_title
     answer_template_ids = await get_schedule_option_ids(sched_id)
     poll_options = await get_answer_template_texts(answer_template_ids)
+    uncertain_option_id = await get_schedule_special_option(sched_id, "uncertain")
+    negative_option_id = await get_schedule_special_option(sched_id, "negative")
+    if uncertain_option_id:
+        txts = await get_answer_template_texts([uncertain_option_id])
+        if txts:
+            poll_options.append(txts[0])
+    if negative_option_id:
+        txts = await get_answer_template_texts([negative_option_id])
+        if txts:
+            poll_options.append(txts[0])
     if not poll_options:
-        # fallback
         poll_options = [t for _, t in await get_default_answer_templates()]
 
     try:
