@@ -50,9 +50,12 @@ DAYS = [
 def today_date_str():
     return datetime.datetime.now().strftime("%d/%m")
 
-def build_poll_options():
-    uncertain = random.choice(uncertain_titles)
-    return ["Да 19:00", "Да 20:00", uncertain, "Нет"]
+def parse_time_from_text(text):
+    match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        return hour * 60 + minute
+    return None
 
 def mention(user):
     if user.get("username"):
@@ -97,11 +100,40 @@ def time_to_cron(time_str):
     hour, minute = match.groups()
     return int(minute), int(hour)
 
+def get_answer_sort_key(text):
+    t = parse_time_from_text(text)
+    return (0, t) if t is not None else (1, 0)
+
+async def get_default_answer_templates():
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT text FROM answer_templates ORDER BY sort_time ASC NULLS LAST, id ASC"
+        ) as cursor:
+            return [row[0] for row in await cursor.fetchall()]
+
+async def init_answer_templates():
+    answers = [
+        ("Да 19:00", 19*60),
+        ("Да 20:00", 20*60)
+    ]
+    async with aiosqlite.connect(DB_FILE) as db:
+        for text, sort_time in answers:
+            await db.execute(
+                "INSERT OR IGNORE INTO answer_templates (text, sort_time) VALUES (?, ?)",
+                (text, sort_time)
+            )
+        await db.commit()
+
 # -------------- FSM для расписания ---------------------------
 
 class ScheduleStates(StatesGroup):
     entering_poll_title = State()
     add_date_to_title = State()
+    choosing_poll_options = State()
+    adding_custom_option = State()
+    confirm_add_another_option = State()
+    ask_uncertain_option = State()
+    ask_negative_option = State()
     choosing_days = State()
     entering_time = State()
     confirm_update = State()
@@ -184,8 +216,15 @@ CREATE TABLE IF NOT EXISTS poll_schedule (
     FOREIGN KEY (group_id) REFERENCES groups(id),
     FOREIGN KEY (thread_id) REFERENCES threads(id)
 );
+CREATE TABLE IF NOT EXISTS answer_templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL UNIQUE,
+    sort_time INTEGER,
+    processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP
+);
             """)
             await db.commit()
+        await init_answer_templates()
         logging.info("DB initialized successfully")
     except Exception as e:
         logging.error(f"{datetime.datetime.now()}: Error initializing DB: {e}")
@@ -277,7 +316,7 @@ async def get_existing_schedule(group_id, thread_id):
                 return {"cron_expr": row[0], "poll_title": row[1], "add_date_to_title": row[2]}
             return None
 
-async def save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title):
+async def save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title, poll_options):
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             "DELETE FROM poll_schedule WHERE group_id=? AND thread_id IS ?",
@@ -297,7 +336,7 @@ async def delete_schedule(group_id, thread_id):
         )
         await db.commit()
 
-# -------------- FSM-диалог для установки/изменения/удаления расписания ----------
+# -------------- FSM-диалог для настройки опций опроса --------
 
 router = Router()
 
@@ -306,7 +345,6 @@ async def poll_settings_command(message: types.Message, state: FSMContext, bot: 
     group_id = message.chat.id
     user_id = message.from_user.id
 
-    # Проверяем статус пользователя
     try:
         member = await bot.get_chat_member(chat_id=group_id, user_id=user_id)
         status = member.status
@@ -385,14 +423,162 @@ async def entering_poll_title(message: types.Message, state: FSMContext):
 async def add_date_to_title_choice(callback: CallbackQuery, state: FSMContext):
     add_date = callback.data == "add_date_yes"
     await state.update_data(add_date_to_title=add_date)
+    # начать этап выбора вариантов
+    default_options = await get_default_answer_templates()
+    await state.update_data(available_options=default_options, selected_options=[])
+    await state.set_state(ScheduleStates.choosing_poll_options)
+    await send_options_choice(callback.message, state)
+    await callback.answer()
+
+async def send_options_choice(message, state):
+    data = await state.get_data()
+    available_options = data.get("available_options", [])
+    selected_options = data.get("selected_options", [])
+    buttons = []
+    for opt in available_options:
+        if opt not in selected_options:
+            buttons.append([InlineKeyboardButton(text=opt, callback_data=f"opt_{opt}")])
+    buttons.append([InlineKeyboardButton(text="Добавить свой ответ", callback_data="add_custom_option")])
+    if selected_options:
+        buttons.append([InlineKeyboardButton(text="Достаточно", callback_data="options_done")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if selected_options:
+        txt = "Выбранные варианты:\n" + "\n".join(f"• {o}" for o in selected_options)
+    else:
+        txt = "Выберите варианты ответа для опроса:"
+    await message.answer(txt, reply_markup=kb)
+
+@router.callback_query(F.data.startswith("opt_"), ScheduleStates.choosing_poll_options)
+async def on_option_chosen(callback: CallbackQuery, state: FSMContext):
+    opt = callback.data[4:]
+    data = await state.get_data()
+    selected_options = data.get("selected_options", [])
+    available_options = data.get("available_options", [])
+    if opt not in selected_options:
+        selected_options.append(opt)
+        await state.update_data(selected_options=selected_options)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await send_options_choice(callback.message, state)
+    await callback.answer()
+
+@router.callback_query(F.data == "add_custom_option", ScheduleStates.choosing_poll_options)
+async def on_add_custom_option(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ScheduleStates.adding_custom_option)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Введите свой вариант ответа (например, Да 18:30):")
+    await callback.answer()
+
+@router.message(ScheduleStates.adding_custom_option)
+async def process_custom_option(message: types.Message, state: FSMContext):
+    option = message.text.strip()
+    if not option or len(option) < 2:
+        await message.answer("Вариант слишком короткий. Введите другой вариант.")
+        return
+    data = await state.get_data()
+    selected_options = data.get("selected_options", [])
+    available_options = data.get("available_options", [])
+    all_options = [o.lower() for o in available_options + selected_options]
+    if option.lower() in all_options:
+        await message.answer("Такой вариант уже есть! Введите другой вариант.")
+        return
+    sort_time = parse_time_from_text(option)
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO answer_templates (text, sort_time) VALUES (?, ?)",
+            (option, sort_time)
+        )
+        await db.commit()
+    selected_options.append(option)
+    available_options.append(option)
+    await state.update_data(selected_options=selected_options, available_options=available_options)
+    await state.set_state(ScheduleStates.confirm_add_another_option)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Добавить еще", callback_data="add_more_custom")],
+            [InlineKeyboardButton(text="Достаточно", callback_data="options_done")],
+        ]
+    )
+    await message.answer(f"Вариант <b>{option}</b> добавлен. Хотите добавить еще?", parse_mode=ParseMode.HTML, reply_markup=kb)
+
+@router.callback_query(F.data == "add_more_custom", ScheduleStates.confirm_add_another_option)
+async def add_more_custom_option(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ScheduleStates.adding_custom_option)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Введите следующий вариант ответа:")
+    await callback.answer()
+
+@router.callback_query(F.data == "options_done", ScheduleStates.choosing_poll_options)
+@router.callback_query(F.data == "options_done", ScheduleStates.confirm_add_another_option)
+async def options_done(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected_options = data.get("selected_options", [])
+    if not selected_options:
+        await callback.answer("Выберите хотя бы один вариант!", show_alert=True)
+        return
+    await state.update_data(selected_options=selected_options)
+    await state.set_state(ScheduleStates.ask_uncertain_option)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да", callback_data="add_uncertain")],
+            [InlineKeyboardButton(text="Нет", callback_data="skip_uncertain")]
+        ]
+    )
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Добавить неопределённый вариант (например, 'Наверное', 'Как карта ляжет')?", reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data == "add_uncertain", ScheduleStates.ask_uncertain_option)
+async def add_uncertain_option(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    uncertain = random.choice(uncertain_titles)
+    selected_options = data.get("selected_options", [])
+    selected_options.append(uncertain)
+    await state.update_data(selected_options=selected_options)
+    await state.set_state(ScheduleStates.ask_negative_option)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да", callback_data="add_negative")],
+            [InlineKeyboardButton(text="Нет", callback_data="skip_negative")]
+        ]
+    )
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Добавить отрицательный вариант 'Нет'?", reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data == "skip_uncertain", ScheduleStates.ask_uncertain_option)
+async def skip_uncertain_option(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ScheduleStates.ask_negative_option)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Да", callback_data="add_negative")],
+            [InlineKeyboardButton(text="Нет", callback_data="skip_negative")]
+        ]
+    )
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Добавить отрицательный вариант 'Нет'?", reply_markup=kb)
+    await callback.answer()
+
+@router.callback_query(F.data == "add_negative", ScheduleStates.ask_negative_option)
+async def add_negative_option(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected_options = data.get("selected_options", [])
+    selected_options.append("Нет")
+    await state.update_data(selected_options=selected_options)
     await state.set_state(ScheduleStates.choosing_days)
     kb = build_days_inline_keyboard()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(
-        "Выберите дни для расписания опроса:",
-        reply_markup=kb
-    )
+    await callback.message.answer("Выберите дни для расписания опроса:", reply_markup=kb)
     await callback.answer()
+
+@router.callback_query(F.data == "skip_negative", ScheduleStates.ask_negative_option)
+async def skip_negative_option(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ScheduleStates.choosing_days)
+    kb = build_days_inline_keyboard()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Выберите дни для расписания опроса:", reply_markup=kb)
+    await callback.answer()
+
+# ------------------- Остальные старые FSM -------------------
 
 @router.callback_query(F.data == "delete_schedule", ScheduleStates.confirm_update)
 async def delete_schedule_confirm(callback: CallbackQuery, state: FSMContext):
@@ -471,10 +657,11 @@ async def enter_time(message: types.Message, state: FSMContext):
     cron_expr = f"{minute} {hour} * * {cron_days}"
     poll_title = data.get("poll_title", "Опрос")
     add_date_to_title = data.get("add_date_to_title", True)
+    poll_options = data.get("selected_options", ["Да 19:00", "Да 20:00", "Нет"])
     group_id = message.chat.id
     thread_id = getattr(message, "message_thread_id", None)
     try:
-        await save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title)
+        await save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title, poll_options)
         await message.answer(
             f"Новое расписание сохранено!\n"
             f"Название опроса: <b>{poll_title}</b>\n"
@@ -523,6 +710,17 @@ async def get_due_schedules(now=None):
         logging.error(f"{datetime.datetime.now()}: Error fetching due schedules: {e}")
         return []
 
+async def get_schedule_options(group_id, thread_id):
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT poll_title FROM poll_schedule WHERE group_id=? AND thread_id IS ? AND is_active=1",
+            (group_id, thread_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row:
+            return row[0]
+    return None
+
 async def start_new_poll(bot, group_id, thread_id, poll_title, add_date_to_title):
     try:
         chat = await bot.get_chat(group_id)
@@ -533,7 +731,19 @@ async def start_new_poll(bot, group_id, thread_id, poll_title, add_date_to_title
         logging.error(f"{datetime.datetime.now()}: Error fetching chat info: {e}")
         await add_group_and_thread(group_id, "", thread_id, "")
 
-    poll_options = build_poll_options()
+    # Получить опции для этого чата/темы через расписание
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT poll_title FROM poll_schedule WHERE group_id=? AND thread_id IS ? AND is_active=1",
+            (group_id, thread_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row:
+            poll_title_from_db = row[0]
+        else:
+            poll_title_from_db = None
+
+    poll_options = await get_default_answer_templates()
     poll_title_final = f"{poll_title} {today_date_str()}" if add_date_to_title else poll_title
 
     try:
