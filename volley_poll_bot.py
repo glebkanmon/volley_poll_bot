@@ -4,6 +4,7 @@ import datetime
 import random
 import asyncio
 import re
+import json
 
 import aiosqlite
 
@@ -107,9 +108,9 @@ def get_answer_sort_key(text):
 async def get_default_answer_templates():
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
-            "SELECT text FROM answer_templates ORDER BY sort_time ASC NULLS LAST, id ASC"
+            "SELECT id, text FROM answer_templates ORDER BY sort_time ASC NULLS LAST, id ASC"
         ) as cursor:
-            return [row[0] for row in await cursor.fetchall()]
+            return [(row[0], row[1]) for row in await cursor.fetchall()]
 
 async def init_answer_templates():
     answers = [
@@ -123,6 +124,33 @@ async def init_answer_templates():
                 (text, sort_time)
             )
         await db.commit()
+
+async def get_or_create_answer_template(text):
+    sort_time = parse_time_from_text(text)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT id FROM answer_templates WHERE LOWER(text)=LOWER(?)", (text,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return row[0]
+        # create new one
+        cur = await db.execute(
+            "INSERT INTO answer_templates (text, sort_time) VALUES (?, ?)", (text, sort_time)
+        )
+        await db.commit()
+        return cur.lastrowid
+
+async def get_answer_template_texts(ids):
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            f"SELECT id, text FROM answer_templates WHERE id IN ({placeholders})", ids
+        ) as cursor:
+            id_to_text = {row[0]: row[1] for row in await cursor.fetchall()}
+    return [id_to_text[i] for i in ids if i in id_to_text]
 
 # -------------- FSM для расписания ---------------------------
 
@@ -222,6 +250,16 @@ CREATE TABLE IF NOT EXISTS answer_templates (
     sort_time INTEGER,
     processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS poll_schedule_x_answer_template (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    poll_schedule_id INTEGER NOT NULL,
+    answer_template_id INTEGER NOT NULL,
+    option_index INTEGER NOT NULL,
+    processed_dttm DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (poll_schedule_id) REFERENCES poll_schedule(id),
+    FOREIGN KEY (answer_template_id) REFERENCES answer_templates(id),
+    UNIQUE(poll_schedule_id, option_index)
+);
             """)
             await db.commit()
         await init_answer_templates()
@@ -308,33 +346,61 @@ async def save_vote(poll_id, user: types.User, option_ids):
 async def get_existing_schedule(group_id, thread_id):
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
-            "SELECT cron_expr, poll_title, add_date_to_title FROM poll_schedule WHERE group_id=? AND thread_id IS ? AND is_active=1",
+            "SELECT id, cron_expr, poll_title, add_date_to_title FROM poll_schedule WHERE group_id=? AND thread_id IS ? AND is_active=1",
             (group_id, thread_id)
         ) as cursor:
             row = await cursor.fetchone()
             if row:
-                return {"cron_expr": row[0], "poll_title": row[1], "add_date_to_title": row[2]}
+                return {
+                    "id": row[0],
+                    "cron_expr": row[1],
+                    "poll_title": row[2],
+                    "add_date_to_title": row[3]
+                }
             return None
 
-async def save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title, poll_options):
+async def save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title, answer_template_ids):
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "DELETE FROM poll_schedule WHERE group_id=? AND thread_id IS ?",
-            (group_id, thread_id)
-        )
-        await db.execute(
+        # Delete old schedule and options
+        async with db.execute(
+            "SELECT id FROM poll_schedule WHERE group_id=? AND thread_id IS ?", (group_id, thread_id)
+        ) as cursor:
+            old = await cursor.fetchone()
+            if old:
+                await db.execute("DELETE FROM poll_schedule_x_answer_template WHERE poll_schedule_id=?", (old[0],))
+                await db.execute("DELETE FROM poll_schedule WHERE id=?", (old[0],))
+        # Insert new schedule
+        cur = await db.execute(
             "INSERT INTO poll_schedule (group_id, thread_id, cron_expr, poll_title, add_date_to_title) VALUES (?, ?, ?, ?, ?)",
             (group_id, thread_id, cron_expr, poll_title, int(add_date_to_title))
         )
+        poll_schedule_id = cur.lastrowid
+        # Insert options
+        for idx, aid in enumerate(answer_template_ids):
+            await db.execute(
+                "INSERT INTO poll_schedule_x_answer_template (poll_schedule_id, answer_template_id, option_index) VALUES (?, ?, ?)",
+                (poll_schedule_id, aid, idx)
+            )
         await db.commit()
 
 async def delete_schedule(group_id, thread_id):
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "DELETE FROM poll_schedule WHERE group_id=? AND thread_id IS ?",
-            (group_id, thread_id)
-        )
-        await db.commit()
+        async with db.execute(
+            "SELECT id FROM poll_schedule WHERE group_id=? AND thread_id IS ?", (group_id, thread_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                await db.execute("DELETE FROM poll_schedule_x_answer_template WHERE poll_schedule_id=?", (row[0],))
+                await db.execute("DELETE FROM poll_schedule WHERE id=?", (row[0],))
+                await db.commit()
+
+async def get_schedule_option_ids(poll_schedule_id):
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute(
+            "SELECT answer_template_id FROM poll_schedule_x_answer_template WHERE poll_schedule_id=? ORDER BY option_index",
+            (poll_schedule_id,)
+        ) as cursor:
+            return [row[0] for row in await cursor.fetchall()]
 
 # -------------- FSM-диалог для настройки опций опроса --------
 
@@ -373,7 +439,7 @@ async def poll_settings_command(message: types.Message, state: FSMContext, bot: 
             "Что хотите сделать?"
         )
         await state.set_state(ScheduleStates.confirm_update)
-        await state.update_data(existing_cron=cron_str, existing_poll_title=poll_title, existing_add_date=add_date)
+        await state.update_data(existing_cron=cron_str, existing_poll_title=poll_title, existing_add_date=add_date, existing_id=existing["id"])
         await message.answer(
             msg,
             parse_mode=ParseMode.HTML,
@@ -423,7 +489,6 @@ async def entering_poll_title(message: types.Message, state: FSMContext):
 async def add_date_to_title_choice(callback: CallbackQuery, state: FSMContext):
     add_date = callback.data == "add_date_yes"
     await state.update_data(add_date_to_title=add_date)
-    # начать этап выбора вариантов
     default_options = await get_default_answer_templates()
     await state.update_data(available_options=default_options, selected_options=[])
     await state.set_state(ScheduleStates.choosing_poll_options)
@@ -434,28 +499,31 @@ async def send_options_choice(message, state):
     data = await state.get_data()
     available_options = data.get("available_options", [])
     selected_options = data.get("selected_options", [])
+    selected_ids = [i for i, _ in selected_options]
     buttons = []
-    for opt in available_options:
-        if opt not in selected_options:
-            buttons.append([InlineKeyboardButton(text=opt, callback_data=f"opt_{opt}")])
+    for opt_id, opt_text in available_options:
+        if opt_id not in selected_ids:
+            buttons.append([InlineKeyboardButton(text=opt_text, callback_data=f"opt_{opt_id}")])
     buttons.append([InlineKeyboardButton(text="Добавить свой ответ", callback_data="add_custom_option")])
     if selected_options:
         buttons.append([InlineKeyboardButton(text="Достаточно", callback_data="options_done")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if selected_options:
-        txt = "Выбранные варианты:\n" + "\n".join(f"• {o}" for o in selected_options)
+        txt = "Выбранные варианты:\n" + "\n".join(f"• {o[1]}" for o in selected_options)
     else:
         txt = "Выберите варианты ответа для опроса:"
     await message.answer(txt, reply_markup=kb)
 
 @router.callback_query(F.data.startswith("opt_"), ScheduleStates.choosing_poll_options)
 async def on_option_chosen(callback: CallbackQuery, state: FSMContext):
-    opt = callback.data[4:]
+    opt_id = int(callback.data[4:])
     data = await state.get_data()
     selected_options = data.get("selected_options", [])
     available_options = data.get("available_options", [])
-    if opt not in selected_options:
-        selected_options.append(opt)
+    # Найти текст по id
+    text = next((t for i, t in available_options if i == opt_id), None)
+    if text and (opt_id, text) not in selected_options:
+        selected_options.append((opt_id, text))
         await state.update_data(selected_options=selected_options)
     await callback.message.edit_reply_markup(reply_markup=None)
     await send_options_choice(callback.message, state)
@@ -477,19 +545,13 @@ async def process_custom_option(message: types.Message, state: FSMContext):
     data = await state.get_data()
     selected_options = data.get("selected_options", [])
     available_options = data.get("available_options", [])
-    all_options = [o.lower() for o in available_options + selected_options]
-    if option.lower() in all_options:
+    all_texts_lower = [t.lower() for _, t in available_options + selected_options]
+    if option.lower() in all_texts_lower:
         await message.answer("Такой вариант уже есть! Введите другой вариант.")
         return
-    sort_time = parse_time_from_text(option)
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO answer_templates (text, sort_time) VALUES (?, ?)",
-            (option, sort_time)
-        )
-        await db.commit()
-    selected_options.append(option)
-    available_options.append(option)
+    opt_id = await get_or_create_answer_template(option)
+    available_options.append((opt_id, option))
+    selected_options.append((opt_id, option))
     await state.update_data(selected_options=selected_options, available_options=available_options)
     await state.set_state(ScheduleStates.confirm_add_another_option)
     kb = InlineKeyboardMarkup(
@@ -531,9 +593,14 @@ async def options_done(callback: CallbackQuery, state: FSMContext):
 async def add_uncertain_option(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     uncertain = random.choice(uncertain_titles)
+    opt_id = await get_or_create_answer_template(uncertain)
     selected_options = data.get("selected_options", [])
-    selected_options.append(uncertain)
-    await state.update_data(selected_options=selected_options)
+    available_options = data.get("available_options", [])
+    if (opt_id, uncertain) not in selected_options:
+        selected_options.append((opt_id, uncertain))
+    if (opt_id, uncertain) not in available_options:
+        available_options.append((opt_id, uncertain))
+    await state.update_data(selected_options=selected_options, available_options=available_options)
     await state.set_state(ScheduleStates.ask_negative_option)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -561,9 +628,14 @@ async def skip_uncertain_option(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "add_negative", ScheduleStates.ask_negative_option)
 async def add_negative_option(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    opt_id = await get_or_create_answer_template("Нет")
     selected_options = data.get("selected_options", [])
-    selected_options.append("Нет")
-    await state.update_data(selected_options=selected_options)
+    available_options = data.get("available_options", [])
+    if (opt_id, "Нет") not in selected_options:
+        selected_options.append((opt_id, "Нет"))
+    if (opt_id, "Нет") not in available_options:
+        available_options.append((opt_id, "Нет"))
+    await state.update_data(selected_options=selected_options, available_options=available_options)
     await state.set_state(ScheduleStates.choosing_days)
     kb = build_days_inline_keyboard()
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -657,11 +729,12 @@ async def enter_time(message: types.Message, state: FSMContext):
     cron_expr = f"{minute} {hour} * * {cron_days}"
     poll_title = data.get("poll_title", "Опрос")
     add_date_to_title = data.get("add_date_to_title", True)
-    poll_options = data.get("selected_options", ["Да 19:00", "Да 20:00", "Нет"])
+    selected_options = data.get("selected_options", [])
+    answer_template_ids = [opt_id for opt_id, _ in selected_options]
     group_id = message.chat.id
     thread_id = getattr(message, "message_thread_id", None)
     try:
-        await save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title, poll_options)
+        await save_or_update_schedule(group_id, thread_id, cron_expr, poll_title, add_date_to_title, answer_template_ids)
         await message.answer(
             f"Новое расписание сохранено!\n"
             f"Название опроса: <b>{poll_title}</b>\n"
@@ -686,11 +759,11 @@ async def get_due_schedules(now=None):
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             async with db.execute(
-                "SELECT group_id, thread_id, cron_expr, poll_title, add_date_to_title FROM poll_schedule WHERE is_active=1"
+                "SELECT id, group_id, thread_id, cron_expr, poll_title, add_date_to_title FROM poll_schedule WHERE is_active=1"
             ) as cursor:
                 rows = await cursor.fetchall()
         result = []
-        for group_id, thread_id, cron_expr, poll_title, add_date_to_title in rows:
+        for sched_id, group_id, thread_id, cron_expr, poll_title, add_date_to_title in rows:
             m = re.match(r'^(\*|\d{1,2})\s+(\*|\d{1,2})\s+\*\s+\*\s+([\d*,]*)$', cron_expr)
             if not m:
                 continue
@@ -700,28 +773,17 @@ async def get_due_schedules(now=None):
             if ch != "*" and int(ch) != hour:
                 continue
             if cd == "*" or cd == "":
-                result.append((group_id, thread_id, poll_title, bool(add_date_to_title)))
+                result.append((sched_id, group_id, thread_id, poll_title, bool(add_date_to_title)))
             else:
                 cd_set = {int(i) for i in cd.split(",")}
                 if weekday in cd_set:
-                    result.append((group_id, thread_id, poll_title, bool(add_date_to_title)))
+                    result.append((sched_id, group_id, thread_id, poll_title, bool(add_date_to_title)))
         return result
     except Exception as e:
         logging.error(f"{datetime.datetime.now()}: Error fetching due schedules: {e}")
         return []
 
-async def get_schedule_options(group_id, thread_id):
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT poll_title FROM poll_schedule WHERE group_id=? AND thread_id IS ? AND is_active=1",
-            (group_id, thread_id)
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row:
-            return row[0]
-    return None
-
-async def start_new_poll(bot, group_id, thread_id, poll_title, add_date_to_title):
+async def start_new_poll(bot, sched_id, group_id, thread_id, poll_title, add_date_to_title):
     try:
         chat = await bot.get_chat(group_id)
         group_title = chat.title or ""
@@ -731,20 +793,12 @@ async def start_new_poll(bot, group_id, thread_id, poll_title, add_date_to_title
         logging.error(f"{datetime.datetime.now()}: Error fetching chat info: {e}")
         await add_group_and_thread(group_id, "", thread_id, "")
 
-    # Получить опции для этого чата/темы через расписание
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute(
-            "SELECT poll_title FROM poll_schedule WHERE group_id=? AND thread_id IS ? AND is_active=1",
-            (group_id, thread_id)
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row:
-            poll_title_from_db = row[0]
-        else:
-            poll_title_from_db = None
-
-    poll_options = await get_default_answer_templates()
     poll_title_final = f"{poll_title} {today_date_str()}" if add_date_to_title else poll_title
+    answer_template_ids = await get_schedule_option_ids(sched_id)
+    poll_options = await get_answer_template_texts(answer_template_ids)
+    if not poll_options:
+        # fallback
+        poll_options = [t for _, t in await get_default_answer_templates()]
 
     try:
         poll_message = await bot.send_poll(
@@ -770,8 +824,8 @@ async def poll_scheduler(bot):
         try:
             now = datetime.datetime.now()
             due = await get_due_schedules(now)
-            for group_id, thread_id, poll_title, add_date_to_title in due:
-                await start_new_poll(bot, group_id, thread_id, poll_title, add_date_to_title)
+            for sched_id, group_id, thread_id, poll_title, add_date_to_title in due:
+                await start_new_poll(bot, sched_id, group_id, thread_id, poll_title, add_date_to_title)
         except Exception as e:
             logging.error(f"{datetime.datetime.now()}: Error in scheduler: {e}")
         await asyncio.sleep(60)
